@@ -1,0 +1,112 @@
+CODEX_INSTRUCTIONS.md: DiscStats - Form & Metric AnalyzerProject OverviewDiscStats is an open-source, zero-cost web application for disc golfers to analyze throw biomechanics and flight metrics from side-view videos. Using client-side computer vision (WebAssembly), DiscStats extracts hand speed, body momentum, release angles, hyzer angle, and spin rate (for multi-color/split discs) without requiring dedicated backend hardware or cloud GPU costs.Technical Stack & ConstraintsInfrastructure & Hosting ($0 Cost Boundary)Deployment & Hosting: Vercel (Hobby Free Tier).Framework: Next.js (App Router, TypeScript, React 19).Database, Auth & Storage: Supabase Free Tier (PostgreSQL, GoTrue Auth, Storage bucket for low-res thumbnails only).Styling & UI: Tailwind CSS, Shadcn/UI, Lucide React icons.Data Visualization: Recharts (for analytics trends, consistency radar, and 2D flight path preview).Vision & Processing EngineEngine: Client-side execution using @mediapipe/tasks-vision (Pose Landmarker running in WebAssembly via Web Workers).Processing Boundary: Zero server-side video uploads or GPU server instances. All video processing occurs inside the browser's HTML5 Canvas and Web Worker pipeline.Project Structure & Architecture BlueprintPlaintext├── app/
+│   ├── (auth)/
+│   │   ├── login/page.tsx
+│   │   └── signup/page.tsx
+│   ├── dashboard/
+│   │   ├── page.tsx            # Trends, historical charts, average cards
+│   │   └── history/page.tsx    # Paginated throw log table
+│   ├── analyze/
+│   │   └── page.tsx            # Video upload, canvas processing, result confirmation
+│   ├── onboarding/page.tsx     # Physical calibration (height/wingspan, handedness)
+│   ├── layout.tsx
+│   └── page.tsx                # Landing page
+├── components/
+│   ├── analyzer/
+│   │   ├── VideoUploader.tsx
+│   │   ├── ProcessingCanvas.tsx
+│   │   ├── CalibrationModal.tsx
+│   │   └── MetricSummaryCard.tsx
+│   ├── dashboard/
+│   │   ├── SpeedTrendChart.tsx
+│   │   ├── AngleScatterChart.tsx
+│   │   ├── FlightPath2D.tsx
+│   │   └── ConsistencyRadar.tsx
+│   └── ui/                     # Shadcn components
+├── lib/
+│   ├── vision/
+│   │   ├── mediapipeWorker.ts  # Web Worker for frame processing
+│   │   ├── poseExtractor.ts    # Keypoint velocity and angle math
+│   │   ├── discTracker.ts      # Multi-color contrast spin analyzer
+│   │   └── flightPhysics.ts    # Aerodynamic trajectory and distance estimator
+│   └── supabase/
+│       ├── client.ts           # Browser Supabase client
+│       └── server.ts           # Server component Supabase client
+├── types/
+│   └── database.ts             # Auto-generated Supabase types
+└── public/
+    └── models/                 # MediaPipe tflite models hosted statically
+Detailed Data Models & Database SchemaDatabase Tables (Supabase PostgreSQL)SQL-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Profiles Table
+CREATE TABLE public.profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    user_height_inches NUMERIC(4,1) NOT NULL,
+    wingspan_inches NUMERIC(4,1) NOT NULL,
+    dominant_hand VARCHAR(4) NOT NULL CHECK (dominant_hand IN ('RHBH', 'LHBH', 'RHFH', 'LHFH')),
+    preferred_units VARCHAR(8) DEFAULT 'imperial' CHECK (preferred_units IN ('imperial', 'metric'))
+);
+
+-- Throws Table
+CREATE TABLE public.throws (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    -- Extracted Biomechanical Metrics
+    arm_speed_mph NUMERIC(4,1) NOT NULL,
+    body_speed_mph NUMERIC(4,1) NOT NULL,
+    launch_angle_deg NUMERIC(4,1) NOT NULL,
+    nose_angle_deg NUMERIC(4,1) NOT NULL,
+    hyzer_angle_deg NUMERIC(4,1) NOT NULL,
+    spin_rate_rpm INT, -- NULL if video/disc unsupported
+    
+    -- Metadata & Discs
+    disc_mold VARCHAR(64),
+    disc_category VARCHAR(16) CHECK (disc_category IN ('Putter', 'Midrange', 'Fairway', 'Distance')),
+    disc_weight_grams INT,
+    video_fps INT NOT NULL,
+    is_low_confidence BOOLEAN DEFAULT FALSE,
+    thumbnail_url TEXT, -- Low-res thumbnail stored in Supabase storage bucket
+    
+    -- Flight Physics Estimates
+    estimated_distance_ft INT
+);
+
+-- Row Level Security (RLS) Policies
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.throws ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can manage their own profile" 
+ON public.profiles FOR ALL USING (auth.uid() = id);
+
+CREATE POLICY "Users can manage their own throws" 
+ON public.throws FOR ALL USING (auth.uid() = user_id);
+Mathematical Foundations & Metric Extraction Rules1. Spatial Scale Calibration (Pixels to Inches)The side-view camera setup relies on the user's recorded height or wingspan as a reference vector:$$\text{Scale Ratio } (S) = \frac{\text{User Height (inches)}}{\text{Height in Pixels } (P_{\text{head}} - P_{\text{ankle}})}$$Measure pixel distance between RIGHT_ANKLE (or LEFT_ANKLE) and NOSE keypoints when the user is standing upright in the calibration frame.2. Precise Release Frame ($t_{\text{release}}$) Identification Algorithm$t_{\text{release}}$ is determined automatically without manual user trimming:Track the wrist position $P_w(t) = (x_t, y_t)$ and shoulder position $P_s(t)$.Calculate wrist-to-shoulder extension distance $D_{ws}(t) = ||P_w(t) - P_s(t)||$.Calculate wrist acceleration $a_w(t) = \frac{v_w(t) - v_w(t-1)}{\Delta t}$.$t_{\text{release}}$ is the frame where $a_w(t)$ undergoes a sharp negative spike (deceleration from release/follow-through) combined with local maximum $D_{ws}(t)$.3. Arm Speed & Forward Body SpeedArm Speed: Peak wrist velocity calculated immediately prior to $t_{\text{release}}$:$$v_{\text{arm}}(t) = \frac{\sqrt{(x_t - x_{t-1})^2 + (y_t - y_{t-1})^2}}{\Delta t} \times S$$Convert inches/sec to MPH ($1 \text{ inch/sec} \approx 0.0568182 \text{ mph}$).Body Speed: Track midpoint of RIGHT_HIP and LEFT_HIP ($C_{\text{hip}}$) during x-step momentum:$$v_{\text{body}}(t) = \frac{|x_{t, \text{hip}} - x_{t-1, \text{hip}}|}{\Delta t} \times S$$4. Launch, Nose, and Hyzer AnglesLaunch Angle ($\theta_{\text{launch}}$): Angle of initial release trajectory relative to ground horizon:$$\theta_{\text{launch}} = \arctan\left(\frac{y_{t+2} - y_{t_{\text{release}}}}{x_{t+2} - x_{t_{\text{release}}}}\right)$$Nose Angle ($\theta_{\text{nose}}$): Pitch angle of disc plane relative to trajectory line:$$\theta_{\text{nose}} = \theta_{\text{disc\_tilt}} - \theta_{\text{launch}}$$(Positive = Nose-Up; Negative = Nose-Down).Hyzer/Anhyzer Angle ($\theta_{\text{hyzer}}$): Inferred in side-view by the angle formed between the elbow-to-wrist forearm vector and vertical plane at $t_{\text{release}}$.5. Aerodynamic 2D Flight Trajectory ModelUsing extracted release metrics ($v_0$, $\theta_{\text{launch}}$, $\theta_{\text{nose}}$), simulate aerodynamic forces frame-by-frame:$$F_L = \frac{1}{2} \rho v^2 A C_L(\alpha)$$$$F_D = \frac{1}{2} \rho v^2 A C_D(\alpha)$$Where:$\rho = 1.225 \text{ kg/m}^3$ (air density).$A = 0.035 \text{ m}^2$ (standard disc surface area).$\alpha = \theta_{\text{nose}}$ (angle of attack).Lift coefficient $C_L(\alpha) = C_{L0} + C_{L\alpha}\alpha$.Drag coefficient $C_D(\alpha) = C_{D0} + k \alpha^2$.Numerical integration (Euler method, $\Delta t = 0.01\text{s}$) runs client-side to generate 2D trajectory arrays [{x: distance_ft, y: height_ft}] and output estimated_distance_ft.6. Multi-Color Disc Spin Tracker (Optional)For split-color discs (e.g., Innova Duo):Detect disc bounding box in post-release frames ($t_{\text{release}}$ to $t_{\text{release}+5}$).Sample pixel color variations along a circular ring around the disc hub.Count color transition frequency $f_{\text{color}}$ across frames.$$\text{Spin Rate (RPM)} = f_{\text{color}} \times 60$$Set spin_rate_rpm = NULL if transition peak confidence is $< 70\%$.Client-Side Processing Pipeline & State MachinePlaintext[Video Selected]
+       │
+       ▼
+[FPS & Resolution Check] ──(FPS < 60)──► [Set Low-Confidence Flag]
+       │
+       ▼
+[Calibration Phase]
+ ├─ Detect upright pose frame.
+ └─ Calculate Pixel-to-Inch Scale Ratio (S).
+       │
+       ▼
+[Web Worker Frame Dispatch]
+ ├─ Execute MediaPipe Pose Landmarker on Canvas frames.
+ ├─ Detect t_release (acceleration peak & arm extension).
+ ├─ Compute Arm Speed, Body Speed, Launch Angle, Nose Angle, Hyzer Angle.
+ └─ (Optional) Run contrast tracker on disc region for Spin Rate.
+       │
+       ▼
+[Physics Simulation]
+ └─ Calculate estimated 2D flight curve & landing distance.
+       │
+       ▼
+[Save Payload to Supabase]
+ ├─ Generate low-res 200x200 PNG thumbnail frame.
+ └─ INSERT record into 'throws' table (No video saved).
+UI/UX & Dashboard RequirementsTechDisc-Style Metric CardsDisplay 4 primary stat cards at top of analyzer result and dashboard:Arm Speed: Big bold gauge (e.g., 58.4 MPH).Nose Angle: Color-coded status (-1.2° = Green/Nose Down; +3.5° = Red/Nose Up).Launch Angle: Value in degrees with trajectory icon.Estimated Distance: Calculated flight distance in feet/meters.Dashboard ChartsSpeed vs. Distance Scatter Plot: Recharts scatter chart plotting Arm Speed ($x$) vs. Distance ($y$).Nose Angle Trend Line: Historical line chart showing user's progress toward consistent nose-down releases over time.Form Consistency Radar: Spider chart evaluating balance across Arm Speed, Body Speed, Nose Angle Control, and Release Angle Consistency.Edge Case Matrix & Handling ProtocolsPotential IssueRoot CauseAutomated Resolution StrategyLow FPS VideoUploaded video recorded at 30 FPS.Display banner: "30 FPS video detected. Release metrics estimated with low confidence. For optimal results, use 60–240 FPS." Set is_low_confidence = true.User Camera ReversedThrower throwing left-to-right vs. right-to-left.Determine movement vector direction at step-in. Normalize all horizontal velocity vectors using absolute delta values $Obstructed Pose KeypointsFollow-through or background elements obstruct wrist.Interpolate missing keypoints across up to 2 frames using linear trajectory projection ($P_{t} = P_{t-1} + \vec{V}_{t-2}$).Supabase Storage ExhaustionUnintentional video upload.Explicitly block raw video blob uploads in code. Convert canvas frame at release to low-quality JPEG thumbnail ($< 50 \text{ KB}$) and upload thumbnail only.Acceptance Criteria & Development Tasks[ ] Auth & Onboarding Flow: User signup, height/wingspan input, and default throwing style selection stored in profiles.[ ] Canvas Web Worker: Background worker processing video frames without locking the browser's main React UI thread.[ ] Side-View Angle Guard: Validate horizontal displacement of body hips to confirm video is shot from a side angle; throw an error if user uploads a direct rear or front view.[ ] Interactive Dashboard: Recharts scatter plot mapping Arm Speed vs. Distance, line chart showing historical Nose Angle progress, and paginated throw log table.[ ] TechDisc Feature Parity: 2D flight curve estimator showing predicted landing distance based on speed and release angles.
